@@ -453,8 +453,20 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ggml-cpu/spacemit/ime_kernels.h
             )
         endif()
+        if (GGML_RV_AME)
+            message(STATUS "RISC-V AME (Matrix Multiply Accelerate) enabled")
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RV_AME)
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/arch/riscv/ame/ame-gemm.c
+                ggml-cpu/arch/riscv/ame/gemm_q8_0_m128k64n128.c
+                ggml-cpu/arch/riscv/ame/ame-matmul.c
+                ggml-cpu/arch/riscv/ame/ame-backend.cpp
+                ggml-cpu/arch/riscv/ame/ame-backend.h
+                ggml-cpu/arch/riscv/ame/ame.h
+            )
+        endif()
         if(NOT GGML_CPU_ALL_VARIANTS)
-            set(MARCH_STR "rv64gc")
+            set(MARCH_STR "rv64g")
             if (GGML_RV_ZFH)
                 string(APPEND MARCH_STR "_zfh")
             endif()
@@ -469,6 +481,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 if (GGML_RV_ZVFBFWMA)
                     string(APPEND MARCH_STR "_zvfbfwma")
                 endif()
+            endif()
+            if (GGML_RV_AME)
+                string(APPEND MARCH_STR "_zame_zvl1024b")
+                # Add matrix-xuantie-0.6 extension support via Xclang target feature
+                list(APPEND ARCH_FLAGS "SHELL:-Xclang -target-feature -Xclang +matrix-xuantie-0.6")
             endif()
             if (GGML_RV_ZICBOP)
                 string(APPEND MARCH_STR "_zicbop")

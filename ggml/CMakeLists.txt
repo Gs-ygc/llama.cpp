@@ -173,6 +173,7 @@ option(GGML_RV_ZFH           "ggml: enable riscv zfh"        ON)
 option(GGML_RV_ZVFH          "ggml: enable riscv zvfh"       ON)
 option(GGML_RV_ZICBOP        "ggml: enable riscv zicbop"     ON)
 option(GGML_RV_ZIHINTPAUSE   "ggml: enable riscv zihintpause "  ON)
+option(GGML_RV_AME           "ggml: enable riscv ame"        OFF)
 option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"     OFF)
 option(GGML_VXE              "ggml: enable vxe"              ${GGML_NATIVE})
 

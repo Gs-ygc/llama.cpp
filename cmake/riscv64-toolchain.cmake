@@ -196,7 +196,19 @@ if (RISCV_USE_LLVM)
     if (RISCV_LIB_PATH)
         set(RISCV_LLVM_LINK_FLAGS "${RISCV_LLVM_LINK_FLAGS} -L${RISCV_LIB_PATH} -B${RISCV_LIB_PATH}")
     endif()
-    set(CMAKE_EXE_LINKER_FLAGS "${RISCV_LLVM_LINK_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} -latomic")
+    
+    # Configure linking based on BUILD_SHARED_LIBS
+    if (NOT BUILD_SHARED_LIBS)
+        # Static linking of libstdc++, libgcc, and OpenMP, but allow dynamic glibc
+        # This avoids issues with missing static C++ standard library
+        set(CMAKE_EXE_LINKER_FLAGS "${RISCV_LLVM_LINK_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++ -static-libgcc -latomic")
+        message(STATUS "RISC-V Toolchain: Using static libstdc++/libgcc")
+    else()
+        # Dynamic linking with static OpenMP
+        set(CMAKE_EXE_LINKER_FLAGS "${RISCV_LLVM_LINK_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} -latomic -static-libgcc -static-libstdc++ -Wl,-Bstatic -lomp -Wl,-Bdynamic")
+        message(STATUS "RISC-V Toolchain: Using dynamic linking with static OpenMP")
+    endif()
+    set(CMAKE_SHARED_LINKER_FLAGS "${RISCV_LLVM_LINK_FLAGS} ${CMAKE_SHARED_LINKER_FLAGS}")
 else()
     set(CMAKE_C_FLAGS   "-march=${RISCV_MARCH} -mabi=${RISCV_MABI} ${CMAKE_C_FLAGS}")
     set(CMAKE_CXX_FLAGS "-march=${RISCV_MARCH} -mabi=${RISCV_MABI} ${CMAKE_CXX_FLAGS}")
