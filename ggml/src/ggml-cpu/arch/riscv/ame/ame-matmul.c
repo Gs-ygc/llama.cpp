@@ -24,7 +24,6 @@ static void ame_vec_dot_q8_0_rvv(int n, float * s, const void * vx, const void *
     
     float sumf = 0;
     size_t vl = qk;
-    
     for (int i = 0; i < nb; ++i) {
         // load elements
         vint8m2_t bx_0 = __riscv_vle8_v_i8m2(x[i].qs, vl);
@@ -185,6 +184,7 @@ void ggml_ame_mul_mat_q8_0(
 #if defined(__riscv_v)
              // If the tile is partial (tail), use RVV implementation directly
             if (imax < AME_TILE_M || jmax < AME_TILE_N) {
+                AME_LOG("Using RVV dot product for tail tile: M=%ld, N=%ld", imax, jmax);
                 for (int64_t i = 0; i < imax; i++) {
                     const block_q8_0 * xi = &x[(i0 + i) * nb_x];
                     for (int64_t j = 0; j < jmax; j++) {

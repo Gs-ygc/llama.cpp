@@ -25,9 +25,9 @@ void ggml_ame_gemm_q8_0(
     int N
 ) {
     // Fixed tile dimensions for the atomic operation
-    const int TILE_M = 128;
-    const int TILE_K = 64;
-    const int TILE_N = 128;
+    const int TILE_M = AME_TILE_M;
+    const int TILE_K = AME_TILE_K;
+    const int TILE_N = AME_TILE_N;
     
     // fprintf(stderr, "[AME] GEMM atomic function: M=%d, N=%d, K=%d (tiles: %dx%dx%d)\n",
     //         M, N, K, TILE_M, TILE_K, TILE_N);

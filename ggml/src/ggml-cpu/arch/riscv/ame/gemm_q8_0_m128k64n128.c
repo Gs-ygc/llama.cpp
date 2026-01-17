@@ -13,7 +13,7 @@ void ggml_ame_gemm_m128k64n128_i8_i32_bT(
     const int TILE_M = AME_TILE_M;
     const int TILE_K = AME_TILE_K;
     const int TILE_N = AME_TILE_N;
-    // printf(".");
+    AME_LOG("ame_gemm m128k64n128_i8_i32_bT called");
     // Configure matrix dimensions
     int tmp;
     MSETTILEM(tmp, TILE_M);

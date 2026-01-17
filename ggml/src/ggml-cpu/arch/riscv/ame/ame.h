@@ -5,15 +5,35 @@
 
 // AME debug logging (default on for development)
 #ifndef AME_DEBUG
-#define AME_DEBUG 0
+#define AME_DEBUG 1
 #endif
 
 #if AME_DEBUG
 #include <stdio.h>
+#include <time.h>
+
+static FILE* ame_log_file = NULL;
+
+static inline void ame_log_init(void) {
+    if (ame_log_file == NULL) {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        char filename[256];
+        snprintf(filename, sizeof(filename), "rv-ame-%04d%02d%02d-%02d%02d%02d.log",
+                 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+                 t->tm_hour, t->tm_min, t->tm_sec);
+        ame_log_file = fopen(filename, "a");
+        if (ame_log_file == NULL) {
+            ame_log_file = stderr; // fallback to stderr if file can't be opened
+        }
+    }
+}
+
 #define AME_LOG(fmt, ...)                             \
     do {                                              \
-        fprintf(stderr, "[AME] " fmt "\n", ##__VA_ARGS__);   \
-        fflush(stderr);                              \
+        ame_log_init();                              \
+        fprintf(ame_log_file, "[AME] " fmt "\n", ##__VA_ARGS__);   \
+        /*fflush(ame_log_file);*/                        \
     } while (0)
 #else
 #define AME_LOG(fmt, ...) do { (void)sizeof(fmt); } while (0)
@@ -21,16 +41,16 @@
 
 // Fixed tile dimensions for AME atomic operation
 // Matches ggml_ame_gemm_q8_0_m128k64n128: M=128, K=64, N=128
-#define AME_TILE_M 128
-#define AME_TILE_K 64
-#define AME_TILE_N 128
+#define AME_TILE_M 16
+#define AME_TILE_K 32
+#define AME_TILE_N 16
 
 // Helper function to check if AME can be used for given dimensions
 // We remove minimum size checks to properly support Q4_0 repacked weights
 // which must use AME backend even for small batches (N=1)
 // Also require K to be a multiple of 32 (Q8_0/Q4_0 block size) for validity
 static inline int ggml_ame_can_use(int M, int N, int K) {
-    if (K % 32 != 0) return 0;
+    // if (K % 32 != 0) return 0;
 
     // AME kernels handle padding/tiling for small dimensions,
     // so we accept any size provided K is aligned.
