@@ -12,10 +12,105 @@
 #include "traits.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
 // AME_DEBUG/AME_LOG now defined in ame.h
+// Simple scalar reference implementation for Q8_0 x F32 matmul
+// Now using tiled approach with ggml_ame_gemm_tile_i8_i32_bT SCALAR version
+static void reference_mul_mat_q8_0_f32(
+    const void * src0_data,
+    const void * src1_data,
+    float * dst_data,
+    int64_t M, int64_t N, int64_t K,
+    size_t src1_stride_bytes
+) {
+    const block_q8_0 * x = (const block_q8_0 *)src0_data;
+    const int64_t nb = K / QK8_0;
+    
+    // Quantize src1 to Q8_0
+    block_q8_0 * y = (block_q8_0 *)malloc(N * nb * sizeof(block_q8_0));
+    
+    for (int64_t n = 0; n < N; n++) {
+        const float * src1_col = (const float *)((const char *)src1_data + n * src1_stride_bytes);
+        ggml_ame_quantize_row_f32_to_q8_0(src1_col, y + n * nb, K);
+    }
+    
+    // Matrix multiply using AME tile function (scalar emulation or real hardware)
+    // Tiling: M=16, N=16, K=32 (one block)
+    const int TILE_M = AME_TILE_M;
+    const int TILE_N = AME_TILE_N;
+    const int TILE_K = AME_TILE_K; // Must be 32 for Q8_0 block match
+
+    // Buffers for one tile
+    // Use aligned allocation for AME instructions (stack or heap)
+    // AME instructions likely require 64-byte alignment
+    int8_t * tile_A = (int8_t *)ggml_aligned_malloc(TILE_M * TILE_K * sizeof(int8_t));
+    int8_t * tile_B = (int8_t *)ggml_aligned_malloc(TILE_N * TILE_K * sizeof(int8_t));
+    int32_t * tile_C = (int32_t *)ggml_aligned_malloc(TILE_M * TILE_N * sizeof(int32_t));
+
+    // Clear destination (if not already cleared by caller, but we overwrite/accumulate correctly)
+    // Actually caller expects us to write result, not accumulate on existing dst? ggml usually expects overwrite unless accumulated.
+    // Standard matmul overwrites.
+    // We will accumulate into dst buffer, so first clear it.
+    memset(dst_data, 0, M * N * sizeof(float));
+
+    for (int64_t m0 = 0; m0 < M; m0 += TILE_M) {
+        for (int64_t n0 = 0; n0 < N; n0 += TILE_N) {
+            
+            // Loop over blocks (K dimension)
+            for (int64_t b = 0; b < nb; b++) {
+                // Pack A tile: [TILE_M, TILE_K]
+                for (int i = 0; i < TILE_M; i++) {
+                    if (m0 + i < M) {
+                         const block_q8_0 * blk = &x[b + (m0 + i) * nb];
+                         memcpy(&tile_A[i * TILE_K], blk->qs, TILE_K);
+                    } else {
+                         memset(&tile_A[i * TILE_K], 0, TILE_K);
+                    }
+                }
+
+                // Pack B tile: [TILE_N, TILE_K]
+                // Note: y is column-major logic (N x nb), but stored linear.
+                // y[b + n*nb] is block for col 'n'.
+                // We want tile_B to have rows corresponding to 'n' (transposed B).
+                for (int j = 0; j < TILE_N; j++) {
+                    if (n0 + j < N) {
+                         const block_q8_0 * blk = &y[b + (n0 + j) * nb];
+                         memcpy(&tile_B[j * TILE_K], blk->qs, TILE_K);
+                    } else {
+                         memset(&tile_B[j * TILE_K], 0, TILE_K);
+                    }
+                }
+
+                // Compute Tile
+                memset(tile_C, 0, TILE_M * TILE_N * sizeof(int32_t));
+                ggml_ame_gemm_tile_i8_i32_bT(tile_A, tile_B, tile_C);
+
+                // Accumulate to destination with scales
+                for (int i = 0; i < TILE_M; i++) {
+                    if (m0 + i >= M) continue;
+                    const float d_a = GGML_FP16_TO_FP32(x[b + (m0 + i) * nb].d);
+                    
+                    for (int j = 0; j < TILE_N; j++) {
+                        if (n0 + j >= N) continue;
+                        const float d_b = GGML_FP16_TO_FP32(y[b + (n0 + j) * nb].d);
+                        
+                        float val = (float)tile_C[i * TILE_N + j];
+                        dst_data[(m0 + i) + (n0 + j) * M] += val * d_a * d_b;
+                    }
+                }
+            }
+        }
+    }
+    
+    ggml_aligned_free(tile_A, TILE_M * TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_B, TILE_N * TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_C, TILE_M * TILE_N * sizeof(int32_t));
+    
+    free(y);
+}
 
 // Check if AME can accelerate this operation
 static bool qtype_has_ame_kernels(ggml_type type) {
@@ -52,7 +147,8 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
             src1->data,
             dst->data,
             ne00, ne01,
-            ne10, ne11
+            ne10, ne11,
+            src1->nb[1]  // pass stride
         );
     } else if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
         AME_LOG("backend_ame_mul_mat: dispatching to Q4_0 kernel");
@@ -62,7 +158,8 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
             src1->data,
             dst->data,
             ne00, ne01,
-            ne10, ne11
+            ne10, ne11,
+            src1->nb[1]
         );
     }
 
@@ -82,6 +179,100 @@ public:
 
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT) {
+            static bool scalar_mode = (getenv("GGML_AME_SCALAR") != nullptr);
+            static bool diff_mode = (getenv("GGML_AME_DIFF") != nullptr);
+            
+            if (scalar_mode) {
+                // Scalar mode: only thread 0 computes, others skip
+                if (params->ith != 0) {
+                    return true;
+                }
+                
+                const ggml_tensor * src0 = op->src[0];
+                const ggml_tensor * src1 = op->src[1];
+                const int64_t M = src0->ne[1];
+                const int64_t N = src1->ne[1];
+                const int64_t K = src0->ne[0];
+                
+                if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
+                    reference_mul_mat_q8_0_f32(
+                        src0->data,
+                        src1->data,
+                        (float *)op->data,
+                        M, N, K,
+                        src1->nb[1]
+                    );
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            
+            if (diff_mode && params->ith == 0) {
+                // DIFF mode: run AME, then reference, then compare
+                const ggml_tensor * src0 = op->src[0];
+                const ggml_tensor * src1 = op->src[1];
+                const int64_t M = src0->ne[1];
+                const int64_t N = src1->ne[1];
+                const int64_t K = src0->ne[0];
+                
+                if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32) {
+                    // Not supported for diff, just run AME
+                    ggml_backend_ame_mul_mat(params, op);
+                    return true;
+                }
+                
+                // Allocate buffer for reference result
+                const size_t result_size = M * N * sizeof(float);
+                float * ref_data = (float *)malloc(result_size);
+                float * ame_data = (float *)malloc(result_size);
+                if (!ref_data || !ame_data) {
+                    free(ref_data);
+                    free(ame_data);
+                    ggml_backend_ame_mul_mat(params, op);
+                    return true;
+                }
+                
+                // Save original output pointer
+                float * original_dst = (float *)op->data;
+                
+                // 1. Run AME
+                ggml_backend_ame_mul_mat(params, op);
+                memcpy(ame_data, original_dst, result_size);
+                
+                // 2. Run reference
+                reference_mul_mat_q8_0_f32(
+                    src0->data,
+                    src1->data,
+                    ref_data,
+                    M, N, K,
+                    src1->nb[1]
+                );
+                
+                // 3. Compare first few elements
+                static int diff_count = 0;
+                if (diff_count < 3) {
+                    fprintf(stderr, "\n[DIFF] Matmul #%d: M=%lld N=%lld K=%lld\n", 
+                            diff_count, (long long)M, (long long)N, (long long)K);
+                    fprintf(stderr, "[DIFF] First 10 elements comparison:\n");
+                    fprintf(stderr, "  Index | AME Result | REF Result | Diff\n");
+                    for (int i = 0; i < 10 && i < M * N; i++) {
+                        float diff = ame_data[i] - ref_data[i];
+                        fprintf(stderr, "  %5d | %10.6f | %10.6f | %+.6f %s\n", 
+                                i, ame_data[i], ref_data[i], diff,
+                                (fabsf(diff) > 0.01f) ? "<!>" : "");
+                    }
+                    diff_count++;
+                }
+                
+                // Use reference result as output
+                memcpy(original_dst, ref_data, result_size);
+                
+                free(ref_data);
+                free(ame_data);
+                return true;
+            }
+            
             AME_LOG("tensor_traits::compute_forward: calling AME mul_mat");
             ggml_backend_ame_mul_mat(params, op);
             AME_LOG("tensor_traits::compute_forward: AME mul_mat completed");

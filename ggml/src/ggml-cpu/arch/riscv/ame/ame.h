@@ -2,10 +2,11 @@
 #define GGML_RISCV_AME_H
 
 #include <stdint.h>
+#include <stddef.h>  // for size_t
 
 // AME debug logging (default on for development)
 #ifndef AME_DEBUG
-#define AME_DEBUG 1
+#define AME_DEBUG 0
 #endif
 
 #if AME_DEBUG
@@ -39,11 +40,9 @@ static inline void ame_log_init(void) {
 #define AME_LOG(fmt, ...) do { (void)sizeof(fmt); } while (0)
 #endif
 
-// Fixed tile dimensions for AME atomic operation
-// Matches ggml_ame_gemm_q8_0_m128k64n128: M=128, K=64, N=128
-#define AME_TILE_M 16
-#define AME_TILE_K 32
-#define AME_TILE_N 16
+#define AME_TILE_M 128
+#define AME_TILE_K 64
+#define AME_TILE_N 128
 
 // Helper function to check if AME can be used for given dimensions
 // We remove minimum size checks to properly support Q4_0 repacked weights
@@ -195,7 +194,13 @@ typedef struct {
     );(RD)=VAL;
 
 // Matrix accumulator zero instruction
-#define MZERO_ACC(ACC) ((void)0)
+#define MZERO_ACC(ACC) \
+    asm volatile ( \
+        "mzero1r " #ACC \
+        : \
+        : \
+        : \
+    )
 
 // Matrix load instructions
 #define MLAE8(REG, SRC, N) \
@@ -253,6 +258,13 @@ typedef struct {
 extern "C" {
 #endif
 
+// Atomic tile GEMM (16x32x16)
+void ggml_ame_gemm_tile_i8_i32_bT(
+    const int8_t * A,
+    const int8_t * B,
+    int32_t * C
+);
+
 // Core AME GEMM function for INT8 matrix multiplication
 // C(M×N) += A(M×K) × B(K×N), where B is transposed in memory
 void ggml_ame_gemm_q8_0(
@@ -263,6 +275,9 @@ void ggml_ame_gemm_q8_0(
     int K,
     int N
 );
+
+// Quantize a row of F32 values to Q8_0 format
+void ggml_ame_quantize_row_f32_to_q8_0(const float * x, void * y, int k);
 
 // Q4_0 weight repacking (called once during set_tensor)
 void ggml_ame_repack_q4_0(
@@ -279,7 +294,8 @@ void ggml_ame_mul_mat_q8_0(
     int64_t ne00,
     int64_t ne01,
     int64_t ne10,
-    int64_t ne11
+    int64_t ne11,
+    size_t src1_stride  // stride in bytes for src1 columns (nb[1])
 );
 
 // GGML integration wrapper for Q4_0 quantized matrix multiplication
@@ -290,7 +306,8 @@ void ggml_ame_mul_mat_q4_0(
     int64_t ne00,
     int64_t ne01,
     int64_t ne10,
-    int64_t ne11
+    int64_t ne11,
+    size_t src1_stride
 );
 
 #ifdef __cplusplus

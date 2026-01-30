@@ -8,14 +8,20 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdio.h>
+
+// Forward declaration of atomic GEMM function
+extern void ggml_ame_gemm_tile_i8_i32_bT(
+    const int8_t * A,      // Input matrix A: MxK
+    const int8_t * B,      // Input matrix B (transposed): NxK
+    int32_t * C            // Output matrix C: MxN
+);
 
 #if defined(__riscv_v)
 #include <riscv_vector.h>
-#endif
 
 // Dot product using RVV for Q8_0 blocks
-// Compatible with block_q8_0 and block_q4_0_ame (same layout)
-#if defined(__riscv_v)
+// Compatible with block_q8_0 layout
 static void ame_vec_dot_q8_0_rvv(int n, float * s, const void * vx, const void * vy) {
     const int qk = 32;
     const int nb = n / qk;
@@ -23,7 +29,11 @@ static void ame_vec_dot_q8_0_rvv(int n, float * s, const void * vx, const void *
     const block_q8_0 * restrict y = (const block_q8_0 *)vy;
     
     float sumf = 0;
-    size_t vl = qk;
+    size_t vl = qk; 
+    // Usually qk=32 fits in one vector register for current HW, 
+    // but code should be generic. Here we assume VLMAX >= 32 or loop handled inside.
+    // For n=K (entire row), we iterate blocks.
+    
     for (int i = 0; i < nb; ++i) {
         // load elements
         vint8m2_t bx_0 = __riscv_vle8_v_i8m2(x[i].qs, vl);
@@ -40,235 +50,157 @@ static void ame_vec_dot_q8_0_rvv(int n, float * s, const void * vx, const void *
     }
     *s = sumf;
 }
+
+// Dot product for Q4_0 (standard format) using RVV
+static void ame_vec_dot_q4_0_rvv(int n, float * s, const void * vx, const void * vy) {
+    const int qk = 32;
+    const int nb = n / qk;
+    const block_q4_0 * restrict x = (const block_q4_0 *)vx;
+    const block_q8_0 * restrict y = (const block_q8_0 *)vy; // y is always quantized to Q8_0 in our gemm
+    
+    float sumf = 0;
+    
+    // We need to unpack q4_0 on the fly for RVV or use widening?
+    // Unpacking to temporary buffer is easiest for clarity
+    int8_t x_unpacked[32]; 
+    
+    for (int i = 0; i < nb; ++i) {
+        // Unpack Q4_0 block
+        for (int j = 0; j < 16; j++) {
+            uint8_t v = x[i].qs[j];
+            x_unpacked[j] = (int8_t)(v & 0x0F) - 8;
+            x_unpacked[j+16] = (int8_t)((v >> 4) & 0x0F) - 8;
+        }
+
+        // Now compute dot with Q8_0 block y[i]
+        int sumi = 0;
+        for (int j = 0; j < 32; j++) {
+            sumi += x_unpacked[j] * y[i].qs[j];
+        }
+        
+        sumf += sumi * (GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
+    }
+    *s = sumf;
+}
 #endif
 
-// Quantize a row of F32 values to Q8_0 format
-// This creates one Q8_0 block (32 int8 values + 1 FP16 scale)
-static void quantize_row_f32_to_q8_0(const float * x, block_q8_0 * y, int k) {
-    assert(k % 32 == 0);
-    const int nb = k / 32;  // Number of blocks
+// ggml_ame_quantize_row_f32_to_q8_0 is now in ame-helper.c
 
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
 
-        // Find max absolute value in this block
-        for (int j = 0; j < 32; j++) {
-            const float v = x[i * 32 + j];
-            const float av = fabsf(v);
-            if (av > amax) {
-                amax = av;
-            }
-        }
-
-        // Compute scale factor (use 127 for symmetric quantization)
-        const float d = amax / 127.0f;
-        const float id = d ? 1.0f / d : 0.0f;
-
-        y[i].d = GGML_FP32_TO_FP16(d);
-
-        // Quantize values to int8 [-127, 127]
-        for (int j = 0; j < 32; j++) {
-            const float x0 = x[i * 32 + j] * id;
-            const int8_t q = roundf(x0);
-            y[i].qs[j] = q;
-        }
-    }
-}
-
-// Repack Q4_0 blocks to AME-optimized format (pre-unpack to int8)
-// This is called once during set_tensor, avoiding repeated unpacking
-void ggml_ame_repack_q4_0(
-    void * dst,
-    const void * src,
-    int64_t nblocks
-) {
-    const block_q4_0 * restrict src_blocks = (const block_q4_0 *)src;
-    block_q4_0_ame * restrict dst_blocks = (block_q4_0_ame *)dst;
-    
-    for (int64_t i = 0; i < nblocks; i++) {
-        // Copy scale factor
-        dst_blocks[i].d = src_blocks[i].d;
-        
-        // Unpack 4-bit values to int8
-        for (int j = 0; j < 16; j++) {
-            const uint8_t byte = src_blocks[i].qs[j];
-            // Low nibble: bits [0:3]
-            const uint8_t v0 = byte & 0x0F;
-            // High nibble: bits [4:7]
-            const uint8_t v1 = (byte >> 4) & 0x0F;
-            
-            // Convert unsigned [0,15] to signed [-8,7]
-            dst_blocks[i].qs[j * 2 + 0] = (int8_t)(v0) - 8;
-            dst_blocks[i].qs[j * 2 + 1] = (int8_t)(v1) - 8;
-        }
-    }
-}
-
-// Pad matrix to AME tile size
-static int8_t * ggml_ame_pad_matrix(
-    const int8_t * src,
-    int rows,
-    int cols,
-    int padded_rows,
-    int padded_cols
-) {
-    if (!src || rows > padded_rows || cols > padded_cols) {
-        return NULL;
-    }
-    
-    size_t total = (size_t)padded_rows * (size_t)padded_cols;
-    int8_t * dst = (int8_t *)calloc(total, sizeof(int8_t));
-    if (!dst) {
-        return NULL;
-    }
-    
-    for (int r = 0; r < rows; r++) {
-        memcpy(dst + (size_t)r * padded_cols,
-               src + (size_t)r * cols,
-               (size_t)cols * sizeof(int8_t));
-    }
-    
-    return dst;
-}
-
-// Wrapper for AME-accelerated quantized matrix multiplication
-// src0: Q8_0 weight matrix (quantized)
-// src1: F32 input matrix (will be quantized on-the-fly)
-// dst: F32 output matrix
+// Wrapper for AME-accelerated Q8_0 GEMM
 void ggml_ame_mul_mat_q8_0(
-    const void * src0,  // Weight matrix (Q8_0 quantized)
+    const void * src0,  // Weight matrix (Q8_0)
     const void * src1,  // Input matrix (F32)
     void * dst,         // Output (F32)
-    int64_t ne00,       // K dimension
-    int64_t ne01,       // M dimension (rows)
-    int64_t ne10,       // K dimension
-    int64_t ne11        // N dimension (columns)
+    int64_t ne00,       // K
+    int64_t ne01,       // M
+    int64_t ne10,       // K (unused)
+    int64_t ne11,       // N
+    size_t src1_stride
 ) {
     const int64_t M = ne01;
     const int64_t N = ne11;
     const int64_t K = ne00;
     
-    (void)ne10; // Unused parameter
-    
-    // fprintf(stderr, "[AME] mul_mat_q8_0: M=%d, N=%d, K=%d\n", M, N, K);//改成mul_mat_q8_0
-    
-    const block_q8_0 * restrict x = (const block_q8_0 *)src0;
-    const float * restrict y_f32 = (const float *)src1;  // F32 input
-    float * restrict out = (float *)dst;
-    
-    // Q8_0 block size is 32, but AME_TILE_K is 64, so we need 2 blocks
     const int qk = 32;
-    const int64_t nb_x = K / qk;  // number of blocks per row in x
-    const int k_blocks_per_tile = AME_TILE_K / qk;  // 64/32 = 2 blocks per tile
-    
-    // Allocate buffer for quantized input (row-major)
-    // We quantize N rows at a time (one row per output column)
-    const int64_t y_q8_size = N * nb_x;  // Number of Q8_0 blocks needed
+    const int64_t nb_x = K / qk;
+
+    const block_q8_0 * restrict x = (const block_q8_0 *)src0;
+    float * restrict out = (float *)dst;
+
+    const int64_t y_q8_size = N * nb_x;
     block_q8_0 * y_q8 = (block_q8_0 *)malloc(y_q8_size * sizeof(block_q8_0));
     if (!y_q8) return;
-    
-    // Quantize F32 input to Q8_0 (by rows)
-    for (int64_t i = 0; i < N; i++) {
-        quantize_row_f32_to_q8_0(y_f32 + i * K, y_q8 + i * nb_x, K);
+
+    // Quantize src1 -> y_q8 (transposed state: y[j][kb] is src1[kb][j])
+    for (int64_t j = 0; j < N; j++) {
+        const float * src1_col = (const float *)((const char *)src1 + j * src1_stride);
+        ggml_ame_quantize_row_f32_to_q8_0(src1_col, y_q8 + j * nb_x, K);
     }
-    
     const block_q8_0 * restrict y = y_q8;
-    
-    // Process tiles with AME
+
+    // Aligned buffers for tiles
+    int8_t tile_a[AME_TILE_M * AME_TILE_K] __attribute__((aligned(64)));
+    int8_t tile_b[AME_TILE_N * AME_TILE_K] __attribute__((aligned(64)));
+    int32_t tile_c[AME_TILE_M * AME_TILE_N] __attribute__((aligned(64)));
+
     for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
-        const int64_t imax = (i0 + AME_TILE_M < M) ? AME_TILE_M : (M - i0);
-        
+        const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
+
         for (int64_t j0 = 0; j0 < N; j0 += AME_TILE_N) {
-            const int64_t jmax = (j0 + AME_TILE_N < N) ? AME_TILE_N : (N - j0);
+            const int jmax = (j0 + AME_TILE_N <= N) ? AME_TILE_N : (N - j0);
 
 #if defined(__riscv_v)
-             // If the tile is partial (tail), use RVV implementation directly
+            // Use RVV for partial/small tiles if requested
             if (imax < AME_TILE_M || jmax < AME_TILE_N) {
-                AME_LOG("Using RVV dot product for tail tile: M=%ld, N=%ld", imax, jmax);
-                for (int64_t i = 0; i < imax; i++) {
-                    const block_q8_0 * xi = &x[(i0 + i) * nb_x];
-                    for (int64_t j = 0; j < jmax; j++) {
-                        const block_q8_0 * yj = &y[(j0 + j) * nb_x];
-                        ame_vec_dot_q8_0_rvv(K, &out[(i0 + i) * N + (j0 + j)], xi, yj);
-                    }
-                }
-                continue;
+                 for (int i = 0; i < imax; ++i) {
+                     for (int j = 0; j < jmax; ++j) {
+                         // Dot product of Row(i0+i) of A and Col(j0+j) of B
+                         const block_q8_0 * row_x = &x[(i0 + i) * nb_x];
+                         const block_q8_0 * col_y = &y[(j0 + j) * nb_x];
+                         ame_vec_dot_q8_0_rvv(K, &out[(j0 + j) * M + (i0 + i)], row_x, col_y);
+                     }
+                 }
+
+                 continue;
             }
 #endif
             
-            // Accumulate for this output tile
-            float tile_out[AME_TILE_M * AME_TILE_N] = {0};
-            
-            // Tile over K dimension: process k_blocks_per_tile Q8_0 blocks at a time
-            for (int64_t kb = 0; kb < nb_x; kb += k_blocks_per_tile) {
-                // Determine how many blocks we can process in this iteration
-                const int64_t kb_end = (kb + k_blocks_per_tile < nb_x) ? k_blocks_per_tile : (nb_x - kb);
-                const int64_t k_size = kb_end * qk;  // Actual K dimension for this tile
-                
-                // Extract int8 data for current K-tile from both matrices
-                int8_t tile_a[AME_TILE_M * AME_TILE_K];
-                int8_t tile_b[AME_TILE_N * AME_TILE_K];
-                float scales_a[AME_TILE_M];
-                float scales_b[AME_TILE_N];
-                
-                memset(tile_a, 0, sizeof(tile_a));
-                memset(tile_b, 0, sizeof(tile_b));
-                
-                // Load A tile: accumulate blocks and compute combined scale
-                for (int64_t i = 0; i < imax; i++) {
-                    float combined_scale = 1.0f;
-                    for (int64_t b = 0; b < kb_end; b++) {
-                        const block_q8_0 * block = &x[(i0 + i) * nb_x + kb + b];
-                        float scale = GGML_FP16_TO_FP32(block->d);
-                        if (b == 0) combined_scale = scale;
-                        memcpy(&tile_a[i * k_size + b * qk], block->qs, qk);
-                    }
-                    scales_a[i] = combined_scale;
+            // Full AME Path for full tiles
+            float acc_f32[AME_TILE_M * AME_TILE_N];
+            memset(acc_f32, 0, sizeof(acc_f32));
+
+            for (int64_t kb = 0; kb < nb_x; kb++) {
+                // Prepare Tile A (16 x 32)
+                for (int i = 0; i < AME_TILE_M; i++) {
+                     if (i < imax) {
+                         const block_q8_0 * b = &x[(i0 + i) * nb_x + kb];
+                         memcpy(&tile_a[i * AME_TILE_K], b->qs, qk);
+                     } else {
+                         memset(&tile_a[i * AME_TILE_K], 0, qk);
+                     }
                 }
-                
-                // Load B tile: accumulate blocks and compute combined scale
-                for (int64_t j = 0; j < jmax; j++) {
-                    float combined_scale = 1.0f;
-                    for (int64_t b = 0; b < kb_end; b++) {
-                        const block_q8_0 * block = &y[(j0 + j) * nb_x + kb + b];
-                        float scale = GGML_FP16_TO_FP32(block->d);
-                        if (b == 0) combined_scale = scale;
-                        memcpy(&tile_b[j * k_size + b * qk], block->qs, qk);
-                    }
-                    scales_b[j] = combined_scale;
+
+                // Prepare Tile B (16 x 32)
+                for (int j = 0; j < AME_TILE_N; j++) {
+                     if (j < jmax) {
+                         const block_q8_0 * b = &y[(j0 + j) * nb_x + kb];
+                         memcpy(&tile_b[j * AME_TILE_K], b->qs, qk);
+                     } else {
+                         memset(&tile_b[j * AME_TILE_K], 0, qk);
+                     }
                 }
-                
-                // Compute int8 GEMM: C += A * B^T
-                int32_t acc[AME_TILE_M * AME_TILE_N] = {0};
-                
-                // AME GEMM with proper K dimension (64)
-                ggml_ame_gemm_q8_0(tile_a, tile_b, acc, imax, k_size, jmax);
-                
-                // Apply scales and accumulate to float output
-                for (int64_t i = 0; i < imax; i++) {
-                    for (int64_t j = 0; j < jmax; j++) {
-                        tile_out[i * AME_TILE_N + j] += 
-                            (float)acc[i * jmax + j] * scales_a[i] * scales_b[j];
-                    }
+
+                memset(tile_c, 0, sizeof(tile_c));
+                ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
+
+                // Accumulate scaling factors
+                for (int i = 0; i < imax; i++) {
+                     const block_q8_0 * bx = &x[(i0 + i) * nb_x + kb];
+                     const float d_x = GGML_FP16_TO_FP32(bx->d);
+                     for (int j = 0; j < jmax; j++) {
+                         const block_q8_0 * by = &y[(j0 + j) * nb_x + kb];
+                         const float d_y = GGML_FP16_TO_FP32(by->d);
+                         
+                         acc_f32[i * AME_TILE_N + j] += tile_c[i * AME_TILE_N + j] * (d_x * d_y);
+                     }
                 }
             }
-            
-            // Write tile to output
-            for (int64_t i = 0; i < imax; i++) {
-                for (int64_t j = 0; j < jmax; j++) {
-                    out[(i0 + i) * N + (j0 + j)] = tile_out[i * AME_TILE_N + j];
+
+            // Copy back
+            for (int i = 0; i < imax; i++) {
+                for (int j = 0; j < jmax; j++) {
+                    out[(j0 + j) * M + (i0 + i)] = acc_f32[i * AME_TILE_N + j];
                 }
             }
         }
     }
-    
-    // Free temporary quantized buffer
+
     free(y_q8);
 }
 
-// GGML integration wrapper for Q4_0 quantized matrix multiplication
-// src0: block_q4_0_ame* (repacked format)
-// src1: F32 input matrix (will be quantized on-the-fly)
+// Wrapper for AME-accelerated Q4_0 GEMM
+// Assumes REPACKED block_q4_0_ame inputs for src0
 void ggml_ame_mul_mat_q4_0(
     const void * src0,
     const void * src1,
@@ -276,113 +208,101 @@ void ggml_ame_mul_mat_q4_0(
     int64_t ne00,
     int64_t ne01,
     int64_t ne10,
-    int64_t ne11
+    int64_t ne11,
+    size_t src1_stride
 ) {
     const int64_t M = ne01;
     const int64_t N = ne11;
     const int64_t K = ne00;
-    
-    (void)ne10; // Unused parameter
-    
-    fprintf(stderr, "[AME] mul_mat_q4_0: M=%d, N=%d, K=%d\n", M, N, K);
-    
-    const block_q4_0_ame * restrict x = (const block_q4_0_ame *)src0;
-    const float * restrict y_f32 = (const float *)src1;  // F32 input
-    float * restrict out = (float *)dst;
-    
-    // Q4_0 block size is 32
     const int qk = 32;
-    const int64_t nb_x = K / qk;  // number of blocks per row in x
-    const int k_blocks_per_tile = AME_TILE_K / qk;  // 64/32 = 2 blocks
-    
-    // Allocate buffer for quantized input
+    const int64_t nb_x = K / qk;
+
+    // Treat src0 as REPACKED block_q4_0_ame
+    // Note: The backend repacks Q4_0 to this format automatically
+    // Layout matches block_q8_0 (d: f16, qs: i8[32]), so we can reuse Q8_0 kernels/logic
+    const block_q4_0_ame * restrict x = (const block_q4_0_ame *)src0;
+    float * restrict out = (float *)dst;
+
     const int64_t y_q8_size = N * nb_x;
     block_q8_0 * y_q8 = (block_q8_0 *)malloc(y_q8_size * sizeof(block_q8_0));
     if (!y_q8) return;
-    
-    // Quantize F32 input to Q8_0 (for int8 GEMM compatibility)
-    for (int64_t i = 0; i < N; i++) {
-        quantize_row_f32_to_q8_0(y_f32 + i * K, y_q8 + i * nb_x, K);
+
+    for (int64_t j = 0; j < N; j++) {
+        const float * src1_col = (const float *)((const char *)src1 + j * src1_stride);
+        ggml_ame_quantize_row_f32_to_q8_0(src1_col, y_q8 + j * nb_x, K);
     }
-    
     const block_q8_0 * restrict y = y_q8;
-    
-    // Process tiles with AME
+
+    int8_t tile_a[AME_TILE_M * AME_TILE_K] __attribute__((aligned(64)));
+    int8_t tile_b[AME_TILE_N * AME_TILE_K] __attribute__((aligned(64)));
+    int32_t tile_c[AME_TILE_M * AME_TILE_N] __attribute__((aligned(64)));
+
     for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
-        const int64_t imax = (i0 + AME_TILE_M < M) ? AME_TILE_M : (M - i0);
-        
+        const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
+
         for (int64_t j0 = 0; j0 < N; j0 += AME_TILE_N) {
-            const int64_t jmax = (j0 + AME_TILE_N < N) ? AME_TILE_N : (N - j0);
+            const int jmax = (j0 + AME_TILE_N <= N) ? AME_TILE_N : (N - j0);
 
 #if defined(__riscv_v)
             if (imax < AME_TILE_M || jmax < AME_TILE_N) {
-                for (int64_t i = 0; i < imax; i++) {
-                    const block_q4_0_ame * xi = &x[(i0 + i) * nb_x];
-                    for (int64_t j = 0; j < jmax; j++) {
-                        const block_q8_0 * yj = &y[(j0 + j) * nb_x];
-                        // Compatible layout: block_q4_0_ame -> block_q8_0
-                        ame_vec_dot_q8_0_rvv(K, &out[(i0 + i) * N + (j0 + j)], (const void*)xi, (const void*)yj);
-                    }
-                }
-                continue;
+                 for (int i = 0; i < imax; ++i) {
+                     for (int j = 0; j < jmax; ++j) {
+                         const block_q4_0_ame * row_x = &x[(i0 + i) * nb_x];
+                         const block_q8_0 * col_y = &y[(j0 + j) * nb_x];
+                         // Repacked Q4_0 layout is compatible with Q8_0 for dot product
+                         ame_vec_dot_q8_0_rvv(K, &out[(j0 + j) * M + (i0 + i)], (const void*)row_x, col_y);
+                     }
+                 }
+                 continue;
             }
 #endif
-            
-            // Accumulate for this output tile
-            float tile_out[AME_TILE_M * AME_TILE_N] = {0};
-            
-            // Tile over K dimension in Q4_0 blocks
+
+            float acc_f32[AME_TILE_M * AME_TILE_N];
+            memset(acc_f32, 0, sizeof(acc_f32));
+
             for (int64_t kb = 0; kb < nb_x; kb++) {
-                // Extract pre-unpacked int8 data for current K-tile
-                int8_t tile_a[AME_TILE_M * qk];
-                int8_t tile_b[AME_TILE_N * qk];
-                float scales_a[AME_TILE_M];
-                float scales_b[AME_TILE_N];
                 
-                // Load A tile (M x qk) - data already unpacked
-                for (int64_t i = 0; i < imax; i++) {
-                    const block_q4_0_ame * block = &x[(i0 + i) * nb_x + kb];
-                    scales_a[i] = GGML_FP16_TO_FP32(block->d);
-                    // Direct copy - no unpacking needed!
-                    for (int k = 0; k < qk; k++) {
-                        tile_a[i * qk + k] = block->qs[k];
-                    }
+                // Prepare Tile A (16 x 32) - Directly copy repacked data
+                for (int i = 0; i < AME_TILE_M; i++) {
+                     if (i < imax) {
+                         const block_q4_0_ame * b = &x[(i0 + i) * nb_x + kb];
+                         memcpy(&tile_a[i * AME_TILE_K], b->qs, qk);
+                     } else {
+                         memset(&tile_a[i * AME_TILE_K], 0, qk);
+                     }
                 }
-                
-                // Load B tile (N x qk) - from Q8_0 quantized input
-                for (int64_t j = 0; j < jmax; j++) {
-                    const block_q8_0 * block = &y[(j0 + j) * nb_x + kb];
-                    scales_b[j] = GGML_FP16_TO_FP32(block->d);
-                    // Copy int8 data
-                    for (int k = 0; k < qk; k++) {
-                        tile_b[j * qk + k] = block->qs[k];
-                    }
+
+                // Prepare Tile B (16 x 32)
+                for (int j = 0; j < AME_TILE_N; j++) {
+                     if (j < jmax) {
+                         const block_q8_0 * b = &y[(j0 + j) * nb_x + kb];
+                         memcpy(&tile_b[j * AME_TILE_K], b->qs, qk);
+                     } else {
+                         memset(&tile_b[j * AME_TILE_K], 0, qk);
+                     }
                 }
-                
-                // Compute int8 GEMM: tile_out += A * B^T (int32 accumulation)
-                int32_t acc[AME_TILE_M * AME_TILE_N] = {0};
-                
-                // AME GEMM expects A: imax x qk, B: jmax x qk, C: imax x jmax
-                ggml_ame_gemm_q8_0(tile_a, tile_b, acc, imax, qk, jmax);
-                
-                // Apply scales and accumulate to float output
-                for (int64_t i = 0; i < imax; i++) {
-                    for (int64_t j = 0; j < jmax; j++) {
-                        tile_out[i * AME_TILE_N + j] += 
-                            (float)acc[i * jmax + j] * scales_a[i] * scales_b[j];
-                    }
+
+                memset(tile_c, 0, sizeof(tile_c));
+                ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
+
+                for (int i = 0; i < imax; i++) {
+                     const block_q4_0_ame * bx = &x[(i0 + i) * nb_x + kb];
+                     const float d_x = GGML_FP16_TO_FP32(bx->d);
+                     for (int j = 0; j < jmax; j++) {
+                         const block_q8_0 * by = &y[(j0 + j) * nb_x + kb];
+                         const float d_y = GGML_FP16_TO_FP32(by->d);
+                         acc_f32[i * AME_TILE_N + j] += tile_c[i * AME_TILE_N + j] * (d_x * d_y);
+                     }
                 }
             }
-            
-            // Write tile to output
-            for (int64_t i = 0; i < imax; i++) {
-                for (int64_t j = 0; j < jmax; j++) {
-                    out[(i0 + i) * N + (j0 + j)] = tile_out[i * AME_TILE_N + j];
+
+            for (int i = 0; i < imax; i++) {
+                for (int j = 0; j < jmax; j++) {
+                    out[(j0 + j) * M + (i0 + i)] = acc_f32[i * AME_TILE_N + j];
                 }
             }
         }
     }
-    
-    // Free quantized buffer
+
     free(y_q8);
 }

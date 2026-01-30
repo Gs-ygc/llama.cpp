@@ -457,9 +457,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             message(STATUS "RISC-V AME (Matrix Multiply Accelerate) enabled")
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RV_AME)
             list(APPEND GGML_CPU_SOURCES
-                ggml-cpu/arch/riscv/ame/ame-gemm.c
-                ggml-cpu/arch/riscv/ame/gemm_q8_0_m128k64n128.c
+                ggml-cpu/arch/riscv/ame/ame_gemm_tile_i8_i32_bT.c
                 ggml-cpu/arch/riscv/ame/ame-matmul.c
+                ggml-cpu/arch/riscv/ame/ame-helper.c
                 ggml-cpu/arch/riscv/ame/ame-backend.cpp
                 ggml-cpu/arch/riscv/ame/ame-backend.h
                 ggml-cpu/arch/riscv/ame/ame.h
