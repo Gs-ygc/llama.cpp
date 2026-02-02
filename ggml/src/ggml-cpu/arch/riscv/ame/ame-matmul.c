@@ -29,22 +29,33 @@ static void ame_vec_dot_q8_0_rvv(int n, float * s, const void * vx, const void *
     const block_q8_0 * restrict y = (const block_q8_0 *)vy;
     
     float sumf = 0;
-    size_t vl = qk; 
-    // Usually qk=32 fits in one vector register for current HW, 
-    // but code should be generic. Here we assume VLMAX >= 32 or loop handled inside.
-    // For n=K (entire row), we iterate blocks.
     
     for (int i = 0; i < nb; ++i) {
-        // load elements
-        vint8m2_t bx_0 = __riscv_vle8_v_i8m2(x[i].qs, vl);
-        vint8m2_t by_0 = __riscv_vle8_v_i8m2(y[i].qs, vl);
+        // Each Q8_0 block has 32 int8 elements
+        // Use vsetvli to handle any VLEN (128, 256, 512, 1024, etc.)
+        size_t vl = __riscv_vsetvl_e8m2(qk);
+        
+        int sumi = 0;
+        size_t offset = 0;
+        
+        // Process block in chunks that fit in vector registers
+        while (offset < qk) {
+            vl = __riscv_vsetvl_e8m2(qk - offset);
+            
+            // Load elements
+            vint8m2_t bx_0 = __riscv_vle8_v_i8m2(x[i].qs + offset, vl);
+            vint8m2_t by_0 = __riscv_vle8_v_i8m2(y[i].qs + offset, vl);
 
-        vint16m4_t vw_mul = __riscv_vwmul_vv_i16m4(bx_0, by_0, vl);
+            // Widen multiply: int8 * int8 -> int16
+            vint16m4_t vw_mul = __riscv_vwmul_vv_i16m4(bx_0, by_0, vl);
 
-        vint32m1_t v_zero = __riscv_vmv_v_x_i32m1(0, vl);
-        vint32m1_t v_sum = __riscv_vwredsum_vs_i16m4_i32m1(vw_mul, v_zero, vl);
+            // Reduce sum: int16 -> int32
+            vint32m1_t v_zero = __riscv_vmv_v_x_i32m1(0, vl);
+            vint32m1_t v_sum = __riscv_vwredsum_vs_i16m4_i32m1(vw_mul, v_zero, vl);
 
-        int sumi = __riscv_vmv_x_s_i32m1_i32(v_sum);
+            sumi += __riscv_vmv_x_s_i32m1_i32(v_sum);
+            offset += vl;
+        }
 
         sumf += sumi * (GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
     }
@@ -60,22 +71,32 @@ static void ame_vec_dot_q4_0_rvv(int n, float * s, const void * vx, const void *
     
     float sumf = 0;
     
-    // We need to unpack q4_0 on the fly for RVV or use widening?
-    // Unpacking to temporary buffer is easiest for clarity
-    int8_t x_unpacked[32]; 
-    
     for (int i = 0; i < nb; ++i) {
-        // Unpack Q4_0 block
+        // Unpack Q4_0 block (4-bit to 8-bit)
+        int8_t x_unpacked[32];
         for (int j = 0; j < 16; j++) {
             uint8_t v = x[i].qs[j];
             x_unpacked[j] = (int8_t)(v & 0x0F) - 8;
             x_unpacked[j+16] = (int8_t)((v >> 4) & 0x0F) - 8;
         }
 
-        // Now compute dot with Q8_0 block y[i]
+        // Now compute dot product with proper vsetvl
         int sumi = 0;
-        for (int j = 0; j < 32; j++) {
-            sumi += x_unpacked[j] * y[i].qs[j];
+        size_t offset = 0;
+        
+        while (offset < qk) {
+            size_t vl = __riscv_vsetvl_e8m2(qk - offset);
+            
+            vint8m2_t bx = __riscv_vle8_v_i8m2(x_unpacked + offset, vl);
+            vint8m2_t by = __riscv_vle8_v_i8m2(y[i].qs + offset, vl);
+            
+            vint16m4_t vw_mul = __riscv_vwmul_vv_i16m4(bx, by, vl);
+            
+            vint32m1_t v_zero = __riscv_vmv_v_x_i32m1(0, vl);
+            vint32m1_t v_sum = __riscv_vwredsum_vs_i16m4_i32m1(vw_mul, v_zero, vl);
+            
+            sumi += __riscv_vmv_x_s_i32m1_i32(v_sum);
+            offset += vl;
         }
         
         sumf += sumi * (GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
